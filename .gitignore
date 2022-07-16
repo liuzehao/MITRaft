@@ -2,3 +2,6 @@ pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
+launch.json
+.DS_Store
+
