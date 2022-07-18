@@ -11,3 +11,9 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+type Entry struct {
+	Index   int
+	Term    int
+	Command interface{}
+}

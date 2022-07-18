@@ -5,3 +5,9 @@ api.key
 launch.json
 .DS_Store
 
+src/raft/raft.go
+
+
+.vscode/dryrun.log
+.vscode/configurationCache.log
+.vscode/targets.log
