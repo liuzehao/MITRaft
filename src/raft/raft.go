@@ -54,22 +54,27 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	currentTerm int
-	votedFor    int
-	logs        []Entry
+	applyCh        chan ApplyMsg
+	applyCond      *sync.Cond
+	replicatorCond []*sync.Cond
+	currentTerm    int
+	votedFor       int
+	logs           []Entry
+
 	commitIndex int
 	lastApplied int
 	nextIndex   []int
 	matchIndex  []int
 
-	// electionTimer  *time.Timer
+	electionTimer *time.Timer
 	// heartbeatTimer *time.Timer
+	state NodeState
 }
 
 // return currentTerm and whether this server
@@ -140,15 +145,26 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(request *RequestVoteRequest, response *RequestVoteResponse) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if request.Term > rf.currentTerm {
 		rf.ChangeState(StateFollower)
 		rf.currentTerm, rf.votedFor = request.Term, -1
 	}
+	rf.votedFor = request.CandidateId
+	rf.electionTimer.Reset(RandomizedElectionTimeout())
+	response.Term, response.VoteGranted = rf.currentTerm, true
+}
+func (rf *Raft) ChangeState(state NodeState) {
+	if rf.state == state {
+		return
+	}
+	DPrintf("{Node %d} changes state from %s to %s in term %d", rf.me, rf.state, state, rf.currentTerm)
+	rf.state = state
 }
 
 //
@@ -180,8 +196,9 @@ func (rf *Raft) RequestVote(request *RequestVoteRequest, response *RequestVoteRe
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+func (rf *Raft) sendRequestVote(server int, request *RequestVoteRequest, response *RequestVoteResponse) bool {
+	//这里应该是一个发送和等待的过程 ，猜里面应该实现了一个自旋锁
+	ok := rf.peers[server].Call("Raft.RequestVote", request, response)
 	return ok
 }
 
@@ -232,15 +249,205 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
+		select {
+		//timer是一个事件，时间到了就会自动发送到这个channel
+		//下面4个行为都在F2 candidate里面有描述 1.currentTerm+1 2.给自己投票 3.重置选举时间 4.发一个requestVote RPC给别的的server
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
+			//将状态设置到candidate
+			rf.ChangeState(StateCandidate)
+			rf.currentTerm += 1
+			//这个是选举test A的核心实现了
+			rf.StartElection()
+			//每次选举的时间是随机的
+			rf.electionTimer.Reset(RandomizedElectionTimeout())
+			rf.mu.Unlock()
+		}
 
 	}
 }
+func (rf *Raft) StartElection() {
+	request := rf.genRequestVoteRequest()
+	DPrintf("{Node %v} starts election with RequestVoteRequest %v", rf.me, request)
+	// use Closure
+	//给自己投票
+	grantedVotes := 1
+	rf.votedFor = rf.me
+	//猜测是保存shootsnap, 不是现阶段的重点，后面再看
+	rf.persist()
+	//向所有的server发送requestVote RPC
+	//同时也要接受，根据论文接受可能的三种情况: 1. 收到大部分的vote，变成leader 2.收到 AppendEntries RPC, 变成follower 3.超时:重新进入选举
+	//这个peer的结构是需要好好理解一下的,但这里还没有体现出作用
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		//这里多线程，说明同时向所有的peer发送了
+		go func(peer int) {
+			//创建了一个RequestVoteResponse 对象
+			response := new(RequestVoteResponse)
+			//rf.sendRequestVote就是发送rpc的函数了
+			if rf.sendRequestVote(peer, request, response) {
+				//这里为什么要锁？上一步同时向所有的peer发送了RequestVote rpc.这里加锁主要是防止grantedVotes这个临界变量冲突
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				DPrintf("{Node %v} receives RequestVoteResponse %v from {Node %v} after sending RequestVoteRequest %v in term %v", rf.me, response, peer, request, rf.currentTerm)
+				if rf.currentTerm == request.Term && rf.state == StateCandidate {
+					if response.VoteGranted {
+						grantedVotes += 1
+						//情况1，变成leader
+						if grantedVotes > len(rf.peers)/2 {
+							DPrintf("{Node %v} receives majority votes in term %v", rf.me, rf.currentTerm)
+							rf.ChangeState(StateLeader)
+							rf.BroadcastHeartbeat(true)
+						} //response.Term > rf.currentTerm说明了已经有了新的leader， 有了新的leader才会有更大的term,这是情况2.论文里面的条件是接收到AppendEntries RPC
+					} else if response.Term > rf.currentTerm {
+						DPrintf("{Node %v} finds a new leader {Node %v} with term %v and steps down in term %v", rf.me, peer, response.Term, rf.currentTerm)
+						rf.ChangeState(StateFollower)
+						rf.currentTerm, rf.votedFor = response.Term, -1
+						rf.persist()
+					}
+				}
+			}
+		}(peer)
+	}
+}
+func (rf *Raft) getLastLog() Entry {
+	return rf.logs[len(rf.logs)-1]
+}
+func (rf *Raft) genRequestVoteRequest() *RequestVoteRequest {
+	lastLog := rf.getLastLog()
+	return &RequestVoteRequest{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
+	}
+}
+func (rf *Raft) BroadcastHeartbeat(isHeartBeat bool) {
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		if isHeartBeat {
+			// need sending at once to maintain leadership，向所有的peer发送心跳来维持leader
+			go rf.replicateOneRound(peer)
+		} else {
+			// just signal replicator goroutine to send entries in batch 这个可能在选举过程中还用不到
+			rf.replicatorCond[peer].Signal()
+		}
+	}
+}
+
+// LogEntry log条目
+type LogEntry struct {
+	Term    int         // leader收到日志条目时的任期
+	Command interface{} // 状态机的command
+}
+
+// AppendEntriesArgs leader复制log条目，也可以当做是心跳连接
+type AppendEntriesResponse struct {
+	Term         int        // leader的任期
+	LeaderId     int        // leader自身的ID
+	PrevLogIndex int        // 新的日志目前的索引值（预计要从哪里追加）
+	PrevLogTerm  int        // 新的日志目前的任期号
+	Entries      []LogEntry // 预计存储的日志（为空时就是心跳连接）
+	LeaderCommit int        // leader的commit index指的是最后一个被大多数机器都复制的日志Index
+}
+
+type AppendEntriesRequest struct {
+	Term    int  // leader的term可能是过时的，此时收到的Term用于更新他自己
+	Success bool //	如果follower与Args中的PreLogIndex/PreLogTerm都匹配才会接过去新的日志（追加），不匹配直接返回false
+}
+
+func (rf *Raft) sendAppendEntries(server int, request *AppendEntriesRequest, response *AppendEntriesResponse) bool {
+	return rf.peers[server].Call("Raft.AppendEntries", request, response)
+}
+
+// 这个函数的功能就是 向peer发送心跳RPC
+func (rf *Raft) replicateOneRound(peer int) {
+	rf.mu.RLock()
+	if rf.state != StateLeader {
+		rf.mu.RUnlock()
+		return
+	}
+	prevLogIndex := rf.nextIndex[peer] - 1
+	// if prevLogIndex < rf.getFirstLog().Index {
+	// 	// only snapshot can catch up
+	// 	request := rf.genInstallSnapshotRequest()
+	// 	rf.mu.RUnlock()
+	// 	response := new(InstallSnapshotResponse)
+	// 	if rf.sendInstallSnapshot(peer, request, response) {
+	// 		rf.mu.Lock()
+	// 		rf.handleInstallSnapshotResponse(peer, request, response)
+	// 		rf.mu.Unlock()
+	// 	}
+	// } else {
+	// 	// just entries can catch up
+	// 	request := rf.genAppendEntriesRequest(prevLogIndex)
+	// 	rf.mu.RUnlock()
+	// 	response := new(AppendEntriesResponse)
+	// 	if rf.sendAppendEntries(peer, request, response) {
+	// 		rf.mu.Lock()
+	// 		rf.handleAppendEntriesResponse(peer, request, response)
+	// 		rf.mu.Unlock()
+	// 	}
+	// }
+	request := rf.genAppendEntriesRequest(prevLogIndex)
+	rf.mu.RUnlock()
+	response := new(AppendEntriesResponse)
+	if rf.sendAppendEntries(peer, request, response) {
+		// rf.mu.Lock()
+		// rf.handleAppendEntriesResponse(peer, request, response)
+		// rf.mu.Unlock()
+		DPrintf("send heatbeat!")
+
+	}
+}
+func (rf *Raft) genAppendEntriesRequest(prevLogIndex int) *AppendEntriesRequest {
+	// firstIndex := rf.getFirstLog().Index
+	// entries := make([]Entry, len(rf.logs[prevLogIndex+1-firstIndex:]))
+	// copy(entries, rf.logs[prevLogIndex+1-firstIndex:])
+	return &AppendEntriesRequest{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.logs[prevLogIndex-firstIndex].Term,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+}
+
+// func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequest, response *AppendEntriesResponse) {
+// 	if rf.state == StateLeader && rf.currentTerm == request.Term {
+// 		if response.Success {
+// 			rf.matchIndex[peer] = request.PrevLogIndex + len(request.Entries)
+// 			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+// 			rf.advanceCommitIndexForLeader()
+// 		} else {
+// 			if response.Term > rf.currentTerm {
+// 				rf.ChangeState(StateFollower)
+// 				rf.currentTerm, rf.votedFor = response.Term, -1
+// 				rf.persist()
+// 			} else if response.Term == rf.currentTerm {
+// 				rf.nextIndex[peer] = response.ConflictIndex
+// 				if response.ConflictTerm != -1 {
+// 					firstIndex := rf.getFirstLog().Index
+// 					for i := request.PrevLogIndex; i >= firstIndex; i-- {
+// 						if rf.logs[i-firstIndex].Term == response.ConflictTerm {
+// 							rf.nextIndex[peer] = i + 1
+// 							break
+// 						}
+// 					}
+// 				}
+// 			}
+// 		}
+// 	}
+// 	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} after handling AppendEntriesResponse %v for AppendEntriesRequest %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), response, request)
+// }
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -255,16 +462,26 @@ func (rf *Raft) ticker() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+	rf := &Raft{
+		peers:         peers,
+		persister:     persister,
+		me:            me,
+		dead:          0,
+		applyCh:       applyCh,
+		state:         StateFollower,
+		currentTerm:   0,
+		votedFor:      -1,
+		logs:          make([]Entry, 1),
+		nextIndex:     make([]int, len(peers)),
+		matchIndex:    make([]int, len(peers)),
+		electionTimer: time.NewTimer(RandomizedElectionTimeout()),
+	}
 
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
+	rf.readPersist(persister.ReadRaftState()) //这个存在的意义我不太理解，先跳过
+	rf.applyCond = sync.NewCond(&rf.mu)       //建立一个rpc锁通道
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
