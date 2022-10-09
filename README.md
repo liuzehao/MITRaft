@@ -92,6 +92,11 @@ raft 算法
    
 
    
+测试的方法：
+```
+cd /Users/mac/Documents/mitclass/6.824/src/raft
+go test -v -race -run 2A
+```
 
 
 
