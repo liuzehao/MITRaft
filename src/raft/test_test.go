@@ -21,6 +21,7 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
+	// 核心在于实现的这个cfg的对象
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 

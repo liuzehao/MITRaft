@@ -92,6 +92,7 @@ raft 算法
    
 
    
+这个基本是测试驱动的写代码方法了，test_test这个测试文件要看一下
 测试的方法：
 ```
 cd /Users/mac/Documents/mitclass/6.824/src/raft
